@@ -1,118 +1,199 @@
 import json
 import math
+from sqlalchemy import text
 from datetime import datetime
 from sqlalchemy.orm import Session
 from fastapi import HTTPException
 from redis import Redis
-from app.db.models import ParkingSlot
-from app.schemas.parking import ParkingSlotBase
+from app.schemas.parking import VehicleRegistrationCreate, ParkingSessionUpdate
 from app.utils.datetime_encoder import DateTimeEncoder
+from app.db.models import VehicleRegistration, ParkingSlot, ParkingSession
+from app.core.config import Settings
+from sqlalchemy.exc import SQLAlchemyError
 
+# Redis client initialization
+redis_client = Redis(host=Settings.REDIS_HOST, port=Settings.REDIS_PORT, db=0)
 
-redis_client = Redis(host='localhost', port=6379, db=0)
+def process_queued_vehicles(vehicle_timeout: ParkingSessionUpdate, background_tasks, db: Session):
+    try:
+        vehicle_checkout = db.query(VehicleRegistration).filter(
+            VehicleRegistration.license_plate == vehicle_timeout.vehicle_id
+        ).first()
 
-def process_queued_vehicles(slot_id: int, background_tasks, db: Session):
-    parking_slot = db.query(ParkingSlot).filter(ParkingSlot.id == slot_id).first()
-    if not parking_slot:
-        raise HTTPException(status_code=404, detail="Parking slot not found.")
-    if parking_slot.is_occupied is False:
-        raise HTTPException(status_code=400, detail="The parking slot is already vacant.")
+        if vehicle_checkout is None:
+            raise HTTPException(status_code=400, detail="Vehicle Registration Not Found")
 
-    entering_time = parking_slot.entering_time
-    exit_time = datetime.now()
-    time_difference = exit_time - entering_time
-    hours_difference = time_difference.total_seconds() / 3600
-    rounded_hours = math.ceil(hours_difference) if hours_difference > 0 else 0
+        parking_session = db.query(ParkingSession).filter(
+            ParkingSession.vehicle_id == vehicle_checkout.vehicle_id,
+            ParkingSession.check_out_time == None
+        ).first()
 
-    total_rent = rounded_hours * 50
+        if parking_session is None:
+            raise HTTPException(status_code=400, detail="No active parking session found for the vehicle")
 
-    parking_slot.is_occupied = False
-    parking_slot.vehicle_number = None
-    parking_slot.entering_time = None
-    db.commit()
+        slot_number = db.query(ParkingSlot).filter(ParkingSlot.id == parking_session.slot_id).first()
+        check_out_time = datetime.now()
+        
+        # Calculate total rent
+        total_rent = calculate_rent(parking_session.check_in_time, check_out_time)
+        parking_session.check_out_time = check_out_time
+        parking_session.total_parked_hours = total_rent["rounded_hours"]
+        parking_session.total_rent = total_rent["rent"]
+        slot_number.is_occupied = False
+        db.commit()
+        
+    except SQLAlchemyError as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Database error: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Error Processing Vehicle: {e}")
 
+    # Assign the next queued vehicle in the background
     background_tasks.add_task(assign_queued_vehicle, db)
-    
+
     return {
-        "free_slot_id": slot_id,
-        "check_out_vehicle_no": parking_slot.vehicle_number,
-        "in_time": entering_time,
-        "out_time": exit_time,
-        "total_parked_hours": rounded_hours,
-        "total_rent": total_rent
+        "check_out_vehicle_no": parking_session.vehicle_id,
+        "in_time": parking_session.check_in_time,
+        "out_time": check_out_time,
+        "total_parked_hours": total_rent["rounded_hours"],
+        "total_rent": total_rent["rent"]
     }
 
 def assign_queued_vehicle(db: Session):
-    queued_vehicle_data = redis_client.lpop("vehicle_queue")
-    if queued_vehicle_data:
+    try:
+        # Pop vehicle data from Redis queue
+        queued_vehicle_data = redis_client.lpop("vehicle_queue")
+        
+        if not queued_vehicle_data:
+            raise HTTPException(status_code=400, detail="No queued vehicle found")
+
         vehicle = json.loads(queued_vehicle_data)
+        if 'vehicle_number' not in vehicle or 'entering_time' not in vehicle:
+            raise HTTPException(status_code=400, detail="Required vehicle data is missing")
+
+        # Find the first available parking slot
         available_slot = db.query(ParkingSlot).filter(ParkingSlot.is_occupied == False).first()
+        
         if available_slot:
-            available_slot.vehicle_number = vehicle['vehicle_number']
-            available_slot.entering_time = vehicle.get("entering_time", datetime.now())
+            vehicle_session = ParkingSession(
+                vehicle_id=vehicle['vehicle_number'],
+                slot_id=available_slot.id,
+                check_in_time=vehicle.get("entering_time", datetime.now())
+            )
+            
+            db.add(vehicle_session)
             available_slot.is_occupied = True
             db.commit()
+            db.refresh(vehicle_session)
+            db.refresh(available_slot)
+        else:
+            raise HTTPException(status_code=400, detail="No available parking slot found")
 
-def initialize_slots(total_slots: int, db: Session):
-    for _ in range(total_slots):
-        new_slot = ParkingSlot(is_occupied=False, vehicle_number=None, entering_time=None)
-        db.add(new_slot)
-    db.commit()
+    except SQLAlchemyError as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Database error: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {e}")
 
-    return {"message": "Slots initialized successfully", "total_slots": total_slots}
-
-def calculate_rent(entering_time: datetime, exit_time: datetime) -> float:
+def calculate_rent(entering_time: datetime, exit_time: datetime) -> dict:
     """Calculates parking rent based on hourly rate."""
     time_difference = exit_time - entering_time
     hours_difference = time_difference.total_seconds() / 3600
     rounded_hours = math.ceil(hours_difference) if hours_difference > 0 else 0
     rate_per_hour = 50
     total_rent = rounded_hours * rate_per_hour
-    return total_rent
+    return {
+        "rounded_hours": rounded_hours,
+        "rent": total_rent
+    }
 
-def vehicle_registration(parkingslot:ParkingSlotBase, db:Session):
-    """Register a vehicle to a parking slot or queue it if no slots are available."""
-    
-    # Count total parking slots in the database
-    total_slots_db = db.query(ParkingSlot.id).count()
-
-    # Check if the vehicle is already occupying a slot
-    user_occupied_slots = db.query(ParkingSlot).filter(
-        ParkingSlot.vehicle_number == parkingslot.vehicle_number, 
-        ParkingSlot.is_occupied == True
+def slot_availability_check(db: Session):
+    # Count the available slots directly
+    available_slots_count = db.query(ParkingSlot).filter(
+        (ParkingSlot.is_occupied == False)
     ).count()
 
-    # If the user has not exceeded their slot limit
-    if user_occupied_slots < total_slots_db:
-        available_slots = db.query(ParkingSlot).filter(
-            (ParkingSlot.is_occupied == False) | (ParkingSlot.is_occupied.is_(None))
-        ).all()
+    queued_vehicle_count = redis_client.llen('vehicle_queue')
+    total_slots_count = db.query(ParkingSlot.id).count()
 
-        # No available slots, queue the vehicle in Redis
-        if not available_slots:
-            print("+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++")
-            print(parkingslot.dict())
-            redis_data = json.dumps(parkingslot.dict(), cls=DateTimeEncoder)
-            print("+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++")
-            print(redis_data)
-            redis_client.rpush('vehicle_queue', redis_data)
-            return {"message": "No available slots. Your request has been queued."}
+    return {
+        "total_slots": total_slots_count,
+        "total_available_slots": available_slots_count,
+        "total_vehicle_queued": queued_vehicle_count
+    }
 
-        # If there's an available slot, assign the vehicle
-        slot_to_update = available_slots[0]
-        slot_to_update.vehicle_number = parkingslot.vehicle_number
-        slot_to_update.entering_time = parkingslot.entering_time
-        slot_to_update.is_occupied = True
 
-        db.commit()
+def initialize_slots(total_slots: int, db: Session):
+    if total_slots < 0:
+        raise HTTPException(status_code=400, detail="Slot limit must be a non-negative integer.")
+    
+    slots = [ParkingSlot(is_occupied=False) for _ in range(total_slots)]
+    db.bulk_save_objects(slots)
+    db.commit()
 
-        remaining_slots = len(available_slots) - 1
+    return {"message": "Total slots limit updated successfully", "total_slots": total_slots}
 
-        return {
-            "assigned_slot": slot_to_update.id,
-            "vehicle_plate_number": slot_to_update.vehicle_number,
-            "entrance_time": slot_to_update.entering_time,
-            "available_slots": remaining_slots
+def parkings_sessions(vehicle_id, check_in_time, db: Session):
+    # Query for an available parking slot
+    available_slot = db.query(ParkingSlot).filter(ParkingSlot.is_occupied == False).first()
+    
+    if not available_slot:
+        vehicle_queuing_details = {
+            "vehicle_number": vehicle_id,
+            "entering_time": check_in_time
         }
-    else:
-        raise HTTPException(status_code=403, detail="You exceeded your slot limit.")
+        redis_data = json.dumps(vehicle_queuing_details, cls=DateTimeEncoder)
+        redis_client.rpush('vehicle_queue', redis_data)
+        
+        return { 
+            "message": "Vehicle queued successfully", 
+            "vehicle_id": vehicle_id 
+        }
+    
+    try:
+        vehicle_session = ParkingSession(
+            vehicle_id=vehicle_id,
+            slot_id=available_slot.id,
+            check_in_time=check_in_time
+        )
+        
+        db.add(vehicle_session)
+        available_slot.is_occupied = True
+        db.commit()
+        db.refresh(vehicle_session)
+        db.refresh(available_slot)
+        
+        return {
+            "message": "Vehicle parked successfully",
+            "vehicle_id": vehicle_id,
+            "slot_id": available_slot.id,
+            "check_in_time": vehicle_session.check_in_time,
+        }
+
+    except SQLAlchemyError as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Database error: {e}")
+
+def vehicle_registration(vehicleRegistrationC: VehicleRegistrationCreate, db: Session):
+    try:
+        existing_vehicle = db.query(VehicleRegistration).filter_by(license_plate=vehicleRegistrationC.license_plate).first()
+
+        if not existing_vehicle:
+            vehicle_registration = VehicleRegistration(
+                license_plate=vehicleRegistrationC.license_plate,
+            )
+            db.add(vehicle_registration)
+            db.commit()
+            db.refresh(vehicle_registration)
+
+            response = parkings_sessions(vehicle_registration.vehicle_id, str(datetime.now()), db)
+        else:
+            response = parkings_sessions(existing_vehicle.vehicle_id, str(datetime.now()), db)
+        
+        return response
+
+    except SQLAlchemyError as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Database error: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Vehicle not registered: {e}")
